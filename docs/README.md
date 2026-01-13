@@ -7,7 +7,7 @@
 </div>
 <br>
 
-# DuckDB DuckLake Extension
+# DuckDB DuckLake Extenasion
 
 > While we tested the DuckLake extension extensively, it is currently experimental as demonstrated by its version number 0.x.
 > If you encounter any problems, please file a [new issue](https://github.com/duckdb/ducklake/issues).
