@@ -2845,6 +2845,7 @@ unique_ptr<QueryResult> DuckLakeMetadataManager::Query(DuckLakeSnapshot snapshot
 
 unique_ptr<QueryResult> DuckLakeMetadataManager::Query(string &query) {
 	SubstituteCatalogPlaceholders(query);
+	transaction.VerifyMetadataStatement(query);
 	return transaction.ExecuteRaw(query);
 }
 
@@ -4213,7 +4214,8 @@ string DuckLakeMetadataManager::WriteNewDataFilesWithAppender(DuckLakeSnapshot &
 		schema_name = "main";
 	}
 
-	// Create appenders for each table
+	// the appenders write into the commit's metadata transaction
+	D_ASSERT(transaction.HasMetadataTransaction());
 	Appender data_file_appender(connection, Identifier(db_name), schema_name, Identifier("ducklake_data_file"));
 	Appender column_stats_appender(connection, Identifier(db_name), schema_name,
 	                               Identifier("ducklake_file_column_stats"));

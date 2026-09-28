@@ -217,6 +217,9 @@ public:
 	void EnsureMetadataTransaction();
 	//! Whether the metadata connection currently has a transaction open
 	bool HasMetadataTransaction();
+	//! Debug check for a statement about to run on the metadata connection: a write runs in the metadata
+	//! transaction, unless it is the clean-up after the commit
+	void VerifyMetadataStatement(const string &query);
 
 	//! Keep a schema cache entry alive for as long as this transaction lives. Transaction-local catalog entries hold
 	//! bare references into the cached catalog set, and those references are read again at commit time, so the entry
@@ -383,6 +386,8 @@ private:
 	unique_ptr<DuckLakeMetadataManager> metadata_manager;
 	mutex connection_lock;
 	unique_ptr<Connection> connection;
+	//! Whether the commit batch has been committed to the metadata catalog (later writes are best-effort clean-up)
+	bool metadata_committed = false;
 
 	Connection &GetConnectionInternal();
 	//! The snapshot of the transaction (latest snapshot in DuckLake)

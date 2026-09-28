@@ -785,6 +785,7 @@ void DuckLakeTransaction::Commit() {
 			// writes to the metadata catalog outside the commit batch: before it, or after it was committed
 			connection->Commit();
 		}
+		metadata_committed = true;
 		if (!changes_made && connection && !state->flushed_inlined_tables.empty()) {
 			DropEmptySupersededInlinedTablesClientSide();
 		}
@@ -870,6 +871,23 @@ void DuckLakeTransaction::EnsureMetadataTransaction() {
 
 bool DuckLakeTransaction::HasMetadataTransaction() {
 	return connection && connection->context->transaction.HasActiveTransaction();
+}
+
+void DuckLakeTransaction::VerifyMetadataStatement(const string &query) {
+#ifdef D_ASSERT_IS_ENABLED
+	auto pos = query.find_first_not_of(" \t\n\r");
+	if (pos == string::npos) {
+		return;
+	}
+	auto keyword = StringUtil::Upper(query.substr(pos, 6));
+	for (auto &write : {"INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER"}) {
+		if (StringUtil::StartsWith(keyword, write)) {
+			// issue writes through the metadata manager's Execute, which opens the transaction
+			D_ASSERT(HasMetadataTransaction() || metadata_committed);
+			return;
+		}
+	}
+#endif
 }
 
 case_insensitive_map_t<unique_ptr<DuckLakeCatalogSet>> &DuckLakeTransaction::GetNewMacroMap(CatalogType type) {
@@ -1463,6 +1481,7 @@ void DuckLakeTransaction::ApplyServerSideCommit(idx_t schema_version) {
 	if (HasMetadataTransaction()) {
 		connection->Commit();
 	}
+	metadata_committed = true;
 }
 
 void DuckLakeTransaction::DropEmptySupersededInlinedTablesClientSide() {
@@ -1513,7 +1532,9 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 		}
 	};
 	context.commit_connection = [&]() {
+		D_ASSERT(HasMetadataTransaction());
 		connection->Commit();
+		metadata_committed = true;
 	};
 	context.try_rollback = [&]() {
 		if (connection->context->transaction.HasActiveTransaction()) {
