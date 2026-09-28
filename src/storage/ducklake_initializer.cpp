@@ -9,6 +9,7 @@
 #include "duckdb/storage/storage_manager.hpp"
 
 #include "storage/ducklake_initializer.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_schema_entry.hpp"
@@ -160,8 +161,11 @@ void DuckLakeInitializer::InitializeDataPath() {
 
 void DuckLakeInitializer::InitializeNewDuckLake(DuckLakeTransaction &transaction, bool has_explicit_schema) {
 	if (options.data_path.empty()) {
-		auto &metadata_catalog =
-		    Catalog::GetCatalog(*transaction.GetConnection().context, Identifier(options.metadata_database));
+		auto metadb = DatabaseManager::Get(context).GetDatabase(Identifier(options.metadata_database));
+		if (!metadb) {
+			throw InvalidInputException("DuckLake metadata catalog \"%s\" is not attached", options.metadata_database);
+		}
+		auto &metadata_catalog = metadb->GetCatalog();
 		if (!metadata_catalog.IsDuckCatalog()) {
 			throw InvalidInputException(
 			    "Attempting to create a new ducklake instance but data_path is not set - set the "

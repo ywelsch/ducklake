@@ -208,7 +208,15 @@ public:
 	unique_ptr<QueryResult> Query(string query);
 	//! Execute SQL on the metadata connection without placeholder substitution or metadata-manager wrapping.
 	unique_ptr<QueryResult> ExecuteRaw(string query);
+	//! The connection to the metadata catalog. It reads in autocommit; the first write to the metadata catalog (a
+	//! metadata manager Execute, or the commit) opens a transaction that lasts until this transaction ends. A
+	//! transaction that only reads or appends therefore does not pin the metadata catalog's old versions or block
+	//! its checkpoints
 	Connection &GetConnection();
+	//! Opens the metadata transaction if none is open yet
+	void EnsureMetadataTransaction();
+	//! Whether the metadata connection currently has a transaction open
+	bool HasMetadataTransaction();
 
 	//! Keep a schema cache entry alive for as long as this transaction lives. Transaction-local catalog entries hold
 	//! bare references into the cached catalog set, and those references are read again at commit time, so the entry
@@ -375,6 +383,8 @@ private:
 	unique_ptr<DuckLakeMetadataManager> metadata_manager;
 	mutex connection_lock;
 	unique_ptr<Connection> connection;
+
+	Connection &GetConnectionInternal();
 	//! The snapshot of the transaction (latest snapshot in DuckLake)
 	mutex snapshot_lock;
 	unique_ptr<DuckLakeSnapshot> snapshot;

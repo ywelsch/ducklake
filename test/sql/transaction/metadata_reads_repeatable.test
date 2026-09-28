@@ -1,0 +1,65 @@
+# name: test/sql/transaction/metadata_reads_repeatable.test
+# description: A DuckLake transaction keeps reading its snapshot while other connections change the catalog
+# group: [transaction]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS lake (DATA_PATH '{DATA_PATH}/metadata_reads_repeatable', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.t(i INTEGER)
+
+statement ok
+INSERT INTO lake.t SELECT range FROM range(100)
+
+statement ok con1
+BEGIN
+
+query I con1
+SELECT COUNT(*) FROM lake.t
+----
+100
+
+# meanwhile: append, delete, alter and create
+statement ok con2
+INSERT INTO lake.t SELECT range FROM range(100, 200)
+
+statement ok con2
+DELETE FROM lake.t WHERE i < 10
+
+statement ok con2
+ALTER TABLE lake.t ADD COLUMN j INTEGER DEFAULT 7
+
+statement ok con2
+CREATE TABLE lake.t2(k INTEGER)
+
+# the reader still sees its own snapshot: rows, columns and tables
+query I con1
+SELECT COUNT(*) FROM lake.t
+----
+100
+
+query I con1
+SELECT COUNT(*) FROM (DESCRIBE lake.t)
+----
+1
+
+statement error con1
+SELECT * FROM lake.t2
+----
+does not exist
+
+statement ok con1
+COMMIT
+
+query III
+SELECT COUNT(*), MIN(i), COUNT(j) FROM lake.t
+----
+190	10	190

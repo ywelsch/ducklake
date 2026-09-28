@@ -777,13 +777,16 @@ void DuckLakeTransaction::UndoConfigOptions() {
 
 void DuckLakeTransaction::Commit() {
 	try {
-		if (ChangesMade()) {
+		bool changes_made = ChangesMade();
+		if (changes_made) {
 			FlushChanges();
-		} else if (connection) {
+		}
+		if (HasMetadataTransaction()) {
+			// writes to the metadata catalog outside the commit batch: before it, or after it was committed
 			connection->Commit();
-			if (!state->flushed_inlined_tables.empty()) {
-				DropEmptySupersededInlinedTablesClientSide();
-			}
+		}
+		if (!changes_made && connection && !state->flushed_inlined_tables.empty()) {
+			DropEmptySupersededInlinedTablesClientSide();
 		}
 	} catch (...) {
 		// a failed commit never reaches Rollback - the transaction manager only reports the error
@@ -801,8 +804,10 @@ void DuckLakeTransaction::Commit() {
 void DuckLakeTransaction::Rollback() {
 	UndoConfigOptions();
 	if (connection) {
-		// rollback any changes made to the metadata catalog
-		connection->Rollback();
+		// rollback a commit that was writing to the metadata catalog
+		if (HasMetadataTransaction()) {
+			connection->Rollback();
+		}
 		connection.reset();
 	}
 	state->CleanupFiles();
@@ -814,6 +819,10 @@ void DuckLakeTransaction::Rollback() {
 
 Connection &DuckLakeTransaction::GetConnection() {
 	lock_guard<mutex> lock(connection_lock);
+	return GetConnectionInternal();
+}
+
+Connection &DuckLakeTransaction::GetConnectionInternal() {
 	if (!connection) {
 		connection = make_uniq<Connection>(db);
 		connection->context->registered_state->GetOrCreate<DuckLakeInternalConnectionState>(
@@ -844,10 +853,23 @@ Connection &DuckLakeTransaction::GetConnection() {
 			// FIXME: sqlite_scanner's per-scan read connections deadlock against concurrent writers
 			connection->Query("SET sqlite_disable_multithreaded_scans=true");
 		}
-		connection->BeginTransaction();
-		connection->Query("SET current_transaction_invalidation_policy='SYNTACTIC_ERRORS_DO_NOT_INVALIDATE'");
 	}
 	return *connection;
+}
+
+void DuckLakeTransaction::EnsureMetadataTransaction() {
+	// writers can run in parallel (e.g. flushing inlined data): only one of them opens the transaction
+	lock_guard<mutex> lock(connection_lock);
+	auto &con = GetConnectionInternal();
+	if (con.context->transaction.HasActiveTransaction()) {
+		return;
+	}
+	con.BeginTransaction();
+	con.Query("SET current_transaction_invalidation_policy='SYNTACTIC_ERRORS_DO_NOT_INVALIDATE'");
+}
+
+bool DuckLakeTransaction::HasMetadataTransaction() {
+	return connection && connection->context->transaction.HasActiveTransaction();
 }
 
 case_insensitive_map_t<unique_ptr<DuckLakeCatalogSet>> &DuckLakeTransaction::GetNewMacroMap(CatalogType type) {
@@ -1438,7 +1460,7 @@ void DuckLakeTransaction::ApplyServerSideCommit(idx_t schema_version) {
 		}
 	}
 	catalog_version = schema_version;
-	if (connection) {
+	if (HasMetadataTransaction()) {
 		connection->Commit();
 	}
 }
@@ -1503,7 +1525,7 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 	context.prepare_retry = [&]() {
 		inlined_inserts.clear();
 		metadata_manager->ClearInlinedTableCaches();
-		connection->BeginTransaction();
+		EnsureMetadataTransaction();
 		snapshot.reset();
 	};
 	context.query_metadata = [&](string q) {
@@ -1605,6 +1627,8 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 	};
 	context.commit_info = state->commit_info;
 	context.supports_v1_1_metadata = ducklake_catalog.SupportsV1_1Metadata();
+	// pre-commit writes (e.g. a flush of inlined data) may have opened the metadata transaction already
+	EnsureMetadataTransaction();
 	state->Commit(transaction_snapshot, transaction_changes, retry_config, context);
 }
 
@@ -1674,9 +1698,13 @@ unique_ptr<QueryResult> DuckLakeTransaction::Query(DuckLakeSnapshot snapshot, st
 }
 
 Identifier DuckLakeTransaction::GetDefaultSchemaName() {
-	auto &metadata_context = *connection->context;
-	auto &db_manager = DatabaseManager::Get(metadata_context);
-	auto metadb = db_manager.GetDatabase(metadata_context, Identifier(ducklake_catalog.MetadataDatabaseName()));
+	// look the database up by name: the metadata connection has no transaction open outside of a commit
+	auto &db_manager = DatabaseManager::Get(db);
+	auto metadb = db_manager.GetDatabase(Identifier(ducklake_catalog.MetadataDatabaseName()));
+	if (!metadb) {
+		throw InvalidInputException("DuckLake metadata catalog \"%s\" is not attached",
+		                            ducklake_catalog.MetadataDatabaseName());
+	}
 	auto default_schema = metadb->GetCatalog().GetDefaultSchema();
 	if (!default_schema) {
 		throw InvalidInputException("DuckLake metadata catalog \"%s\" has no default schema, set METADATA_SCHEMA "

@@ -1,0 +1,55 @@
+# name: test/sql/transaction/metadata_reads_snapshot_expired.test
+# description: A reader whose snapshot is expired and cleaned up while it is open
+# group: [transaction]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS lake (DATA_PATH '{DATA_PATH}/metadata_reads_snapshot_expired', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.t(i INTEGER)
+
+statement ok
+INSERT INTO lake.t SELECT range FROM range(100)
+
+statement ok con1
+BEGIN
+
+query I con1
+SELECT COUNT(*) FROM lake.t
+----
+100
+
+# rewrite the reader's file away, then expire its snapshot and delete the file
+statement ok con2
+DELETE FROM lake.t WHERE i >= 0
+
+statement ok con2
+INSERT INTO lake.t SELECT range FROM range(5)
+
+statement ok con2
+CALL ducklake_expire_snapshots('lake', older_than => now())
+
+statement ok con2
+CALL ducklake_cleanup_old_files('lake', cleanup_all => true)
+
+# the reader's snapshot is gone from the catalog: what does it see?
+statement maybe con1
+SELECT COUNT(*) FROM lake.t
+----
+<REGEX>:.*
+
+statement ok con1
+ROLLBACK
+
+query I
+SELECT COUNT(*) FROM lake.t
+----
+5

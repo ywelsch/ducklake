@@ -181,6 +181,8 @@ string DuckLakeMetadataManager::ListAggregation(const vector<pair<string, string
 unique_ptr<QueryResult> DuckLakeMetadataManager::AttachMetadata(const string &attach_query) {
 	auto query = attach_query;
 	SubstituteCatalogPlaceholders(query);
+	// a catalog write: a DuckLake ATTACH that fails afterwards rolls it back
+	transaction.EnsureMetadataTransaction();
 	return transaction.ExecuteRaw(query);
 }
 
@@ -2826,10 +2828,13 @@ void DuckLakeMetadataManager::SubstituteSnapshotPlaceholders(DuckLakeSnapshot sn
 }
 
 unique_ptr<QueryResult> DuckLakeMetadataManager::Execute(DuckLakeSnapshot snapshot, string &query) {
-	return Query(snapshot, query);
+	SubstituteSnapshotPlaceholders(snapshot, query);
+	return Execute(query);
 }
 
 unique_ptr<QueryResult> DuckLakeMetadataManager::Execute(string &query) {
+	// writes run in the metadata transaction, so that they roll back with the DuckLake transaction
+	transaction.EnsureMetadataTransaction();
 	return Query(query);
 }
 
@@ -6151,7 +6156,7 @@ bool DuckLakeMetadataManager::ResetConfigOption(const DuckLakeConfigOption &opti
 	string scope_id;
 	string scope_filter;
 	ConfigOptionScope(option, scope, scope_id, scope_filter);
-	auto result = Query(StringUtil::Format(R"(
+	auto result = Execute(StringUtil::Format(R"(
 DELETE FROM {METADATA_CATALOG}.ducklake_metadata WHERE key = %s AND %s
 )",
 	                                       SQLString(option.option.key), scope_filter));
