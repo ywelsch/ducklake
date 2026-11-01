@@ -84,6 +84,8 @@ public:
 	                  Binder &binder, TableIndex table_id, uint64_t max_files, DuckLakeMergeAdjacentOptions options);
 	DuckLakeCompactor(ClientContext &context, DuckLakeCatalog &catalog, DuckLakeTransaction &transaction,
 	                  Binder &binder, TableIndex table_id, uint64_t max_files, double delete_threshold);
+	//! Rewrite each partition whose files are not ordered by the table's sort into one sorted run
+	void SetSortMode(optional_idx max_slice_size);
 	void GenerateCompactions(DuckLakeTableEntry &table, vector<unique_ptr<LogicalOperator>> &compactions);
 	unique_ptr<LogicalOperator> GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry> source_files,
 	                                                      bool bind_to_latest_schema = false);
@@ -105,6 +107,16 @@ public:
 	                unique_ptr<LogicalCopyToFile> &copy);
 
 private:
+	bool PartitionIsSorted(DuckLakeTableEntry &latest_table, const vector<DuckLakeCompactionFileEntry> &files,
+	                       const vector<idx_t> &file_indexes);
+	vector<Value> ComputeSliceBoundaries(DuckLakeTableEntry &latest_table,
+	                                     const vector<DuckLakeCompactionFileEntry> &source_files);
+	unique_ptr<LogicalOperator> PlanSortedSlices(DuckLakeTableEntry &table, DuckLakeTableEntry &latest_table,
+	                                             DuckLakeSort &sort_data, unique_ptr<LogicalOperator> &first_scan,
+	                                             unique_ptr<LogicalCopyToFile> &first_copy,
+	                                             const vector<Value> &boundaries, const string &data_path,
+	                                             const string &encryption_key, bool write_snapshot_id,
+	                                             const vector<DuckLakeFileListEntry> &files_to_scan);
 	optional_ptr<DuckLakeTableEntry> ResolvePartitionSpecTable(DuckLakeTableEntry &table,
 	                                                           const DuckLakeCompactionFileEntry &source_file,
 	                                                           idx_t partition_id);
@@ -117,6 +129,8 @@ private:
 	uint64_t max_files;
 	double delete_threshold = 0.95;
 	DuckLakeMergeAdjacentOptions options;
+	bool sort_mode = false;
+	optional_idx max_slice_size;
 
 	CompactionType type;
 };

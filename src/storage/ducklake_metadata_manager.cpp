@@ -2734,6 +2734,26 @@ DuckLakeMetadataManager::GetExtendedFilesForTable(DuckLakeTableEntry &table, Duc
 	return files;
 }
 
+map<DataFileIndex, pair<string, string>> DuckLakeMetadataManager::GetFileColumnBounds(TableIndex table_id,
+                                                                                      FieldIndex column_id,
+                                                                                      const set<DataFileIndex> &files) {
+	map<DataFileIndex, pair<string, string>> bounds;
+	if (files.empty()) {
+		return bounds;
+	}
+	auto result = Query(StringUtil::Format(R"(
+SELECT data_file_id, min_value, max_value
+FROM {METADATA_CATALOG}.ducklake_file_column_stats
+WHERE table_id = %d AND column_id = %d AND data_file_id IN (%s) AND min_value IS NOT NULL AND max_value IS NOT NULL)",
+	                                       table_id.index, column_id.index, GenerateIDList(files)));
+	result->ThrowIfError("Failed to get the file statistics of a table from DuckLake: ");
+	for (auto &row : *result) {
+		bounds.emplace(DataFileIndex(row.GetValue<idx_t>(0)),
+		               make_pair(row.GetValue<string>(1), row.GetValue<string>(2)));
+	}
+	return bounds;
+}
+
 vector<DuckLakeCompactionFileEntry> DuckLakeMetadataManager::GetFilesForCompaction(DuckLakeTableEntry &table,
                                                                                    CompactionType type,
                                                                                    double deletion_threshold,

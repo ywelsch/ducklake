@@ -69,6 +69,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto rewrite_files = DuckLakeRewriteDataFilesFunction::GetFunctions();
 	loader.RegisterFunction(rewrite_files);
 
+	auto sort_files = DuckLakeSortDataFilesFunction::GetFunctions();
+	loader.RegisterFunction(sort_files);
+
 	DuckLakeCleanupOldFilesFunction cleanup_old_files;
 	loader.RegisterFunction(cleanup_old_files);
 

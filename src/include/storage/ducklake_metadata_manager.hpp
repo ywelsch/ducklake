@@ -368,6 +368,9 @@ public:
 	                                                                  double deletion_threshold,
 	                                                                  DuckLakeSnapshot snapshot,
 	                                                                  DuckLakeFileSizeOptions options);
+	//! The min and max statistics of a column in each of the given data files that has both
+	map<DataFileIndex, pair<string, string>> GetFileColumnBounds(TableIndex table_id, FieldIndex column_id,
+	                                                             const set<DataFileIndex> &files);
 	virtual idx_t GetBeginSnapshotForTable(TableIndex table_id);
 	virtual idx_t GetBeginSnapshotForSchemaVersion(TableIndex table_id, idx_t schema_version);
 	DuckLakeTableSchemaVersions GetTableSchemaVersions(TableIndex table_id, DuckLakeSnapshot snapshot);

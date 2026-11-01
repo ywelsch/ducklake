@@ -1,0 +1,213 @@
+# name: test/sql/compaction/sort_data_files.test
+# description: ducklake_sort_data_files rewrites each partition into files ordered by the sort key
+# group: [compaction]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/sort_data_files', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+USE ducklake
+
+# file ranges of the sort key of the live files of a table, and how many overlap a lower range
+statement ok
+CREATE MACRO memory.file_ranges(tbl, col) AS TABLE
+WITH f AS (
+	SELECT s.min_value AS lo, s.max_value AS hi
+	FROM __ducklake_metadata_ducklake.ducklake_data_file d
+	JOIN __ducklake_metadata_ducklake.ducklake_file_column_stats s USING (data_file_id)
+	JOIN __ducklake_metadata_ducklake.ducklake_column c
+		ON c.table_id = s.table_id AND c.column_id = s.column_id AND c.end_snapshot IS NULL
+	JOIN __ducklake_metadata_ducklake.ducklake_table t ON t.table_id = d.table_id AND t.end_snapshot IS NULL
+	WHERE d.end_snapshot IS NULL AND t.table_name = tbl AND c.column_name = col
+)
+SELECT count(*) AS file_count, count(*) FILTER (WHERE lo < prev_hi) AS overlap_count
+FROM (SELECT *, lag(hi) OVER (ORDER BY lo, hi) AS prev_hi FROM f)
+
+# a table without a sort has nothing to sort
+statement ok
+CREATE TABLE unsorted (k VARCHAR, v BIGINT)
+
+statement ok
+INSERT INTO unsorted SELECT 'k' || (i % 10), i FROM range(100) t(i)
+
+statement ok
+INSERT INTO unsorted SELECT 'k' || (i % 10), i FROM range(100) t(i)
+
+query I
+SELECT count(*) FROM ducklake_sort_data_files('ducklake', 'unsorted')
+----
+0
+
+# every insert holds every key, so the files of the table overlap
+statement ok
+CREATE TABLE t (k VARCHAR, ts BIGINT, v DOUBLE)
+
+statement ok
+ALTER TABLE t SET SORTED BY (k, ts)
+
+statement ok
+CALL ducklake.set_option('parquet_row_group_size', '1024', table_name => 't')
+
+statement ok
+INSERT INTO t SELECT 'k' || lpad((i * 7919 % 200)::VARCHAR, 3, '0'), i, i FROM range(20000) r(i)
+
+statement ok
+INSERT INTO t SELECT 'k' || lpad((i * 7919 % 200)::VARCHAR, 3, '0'), i + 20000, i FROM range(20000) r(i)
+
+statement ok
+INSERT INTO t SELECT 'k' || lpad((i * 7919 % 200)::VARCHAR, 3, '0'), i + 40000, i FROM range(20000) r(i)
+
+statement ok
+INSERT INTO t SELECT 'k' || lpad((i * 7919 % 200)::VARCHAR, 3, '0'), i + 60000, i FROM range(20000) r(i)
+
+query II
+SELECT * FROM memory.file_ranges('t', 'k')
+----
+4	3
+
+query III
+SELECT count(*), sum(v), count(DISTINCT k) FROM t
+----
+80000	799960000.0	200
+
+statement ok
+SET VARIABLE before_sort = (SELECT max(snapshot_id) FROM ducklake_snapshots('ducklake'))
+
+# small files, so the sort is split into slices by key range and each slice into files
+statement ok
+SET ducklake_target_file_size = '100KB'
+
+query IIII
+SELECT schema_name, table_name, files_processed, files_created > 1 FROM ducklake_sort_data_files('ducklake', 't')
+----
+main	t	4	true
+
+query II
+SELECT file_count > 1, overlap_count FROM memory.file_ranges('t', 'k')
+----
+true	0
+
+query III
+SELECT count(*), sum(v), count(DISTINCT k) FROM t
+----
+80000	799960000.0	200
+
+query III
+SELECT count(*), sum(v), count(DISTINCT k) FROM t AT (VERSION => getvariable('before_sort'))
+----
+80000	799960000.0	200
+
+# a sorted partition is left alone
+query I
+SELECT count(*) FROM ducklake_sort_data_files('ducklake', 't')
+----
+0
+
+# a new file overlaps the sorted files again
+statement ok
+INSERT INTO t SELECT 'k' || lpad((i * 7919 % 200)::VARCHAR, 3, '0'), i + 80000, i FROM range(2000) r(i)
+
+query I
+SELECT overlap_count > 0 FROM memory.file_ranges('t', 'k')
+----
+true
+
+query I
+SELECT files_processed > 1 FROM ducklake_sort_data_files('ducklake', 't')
+----
+true
+
+query II
+SELECT file_count > 1, overlap_count FROM memory.file_ranges('t', 'k')
+----
+true	0
+
+query II
+SELECT count(*), sum(v) FROM t
+----
+82000	801959000.0
+
+# a descending key with NULLs first
+statement ok
+CREATE TABLE d (k VARCHAR, v BIGINT)
+
+statement ok
+ALTER TABLE d SET SORTED BY (k DESC NULLS FIRST)
+
+statement ok
+CALL ducklake.set_option('parquet_row_group_size', '1024', table_name => 'd')
+
+statement ok
+INSERT INTO d SELECT CASE WHEN i % 50 = 0 THEN NULL ELSE 'k' || lpad((i % 300)::VARCHAR, 3, '0') END, i FROM range(15000) r(i)
+
+statement ok
+INSERT INTO d SELECT CASE WHEN i % 50 = 0 THEN NULL ELSE 'k' || lpad((i % 300)::VARCHAR, 3, '0') END, i FROM range(15000) r(i)
+
+statement ok
+INSERT INTO d SELECT CASE WHEN i % 50 = 0 THEN NULL ELSE 'k' || lpad((i % 300)::VARCHAR, 3, '0') END, i FROM range(15000) r(i)
+
+statement ok
+SET ducklake_target_file_size = '60KB'
+
+query I
+SELECT files_processed FROM ducklake_sort_data_files('ducklake', 'd')
+----
+3
+
+query II
+SELECT file_count > 1, overlap_count FROM memory.file_ranges('d', 'k')
+----
+true	0
+
+query III
+SELECT count(*), count(k), sum(v) FROM d
+----
+45000	44100	337477500
+
+# partitions are sorted one by one
+statement ok
+CREATE TABLE p (part INTEGER, k VARCHAR, v BIGINT)
+
+statement ok
+ALTER TABLE p SET PARTITIONED BY (part)
+
+statement ok
+ALTER TABLE p SET SORTED BY (k)
+
+statement ok
+INSERT INTO p SELECT i % 2, 'k' || lpad((i * 31 % 100)::VARCHAR, 3, '0'), i FROM range(4000) r(i)
+
+statement ok
+INSERT INTO p SELECT i % 2, 'k' || lpad((i * 31 % 100)::VARCHAR, 3, '0'), i FROM range(4000) r(i)
+
+statement ok
+SET ducklake_target_file_size = '512MB'
+
+query I
+SELECT files_processed FROM ducklake_sort_data_files('ducklake', 'p') ORDER BY ALL
+----
+2
+2
+
+query I
+SELECT count(*) FROM ducklake_list_files('ducklake', 'p')
+----
+2
+
+query II
+SELECT count(*), sum(v) FROM p
+----
+8000	15996000
+
+statement error
+SELECT * FROM ducklake_sort_data_files('ducklake', 't', max_slice_size => 0)
+----
+The max_slice_size option must be greater than zero
