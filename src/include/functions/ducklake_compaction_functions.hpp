@@ -78,6 +78,14 @@ public:
 //===--------------------------------------------------------------------===//
 // Compaction Command Generator
 //===--------------------------------------------------------------------===//
+//! Where a slice of a sorted rewrite starts: at a value of the first sort key, or inside the rows of one value of the
+//! first sort key at a value of the second
+struct DuckLakeSliceBound {
+	Value first;
+	Value second;
+	bool has_second = false;
+};
+
 class DuckLakeCompactor {
 public:
 	DuckLakeCompactor(ClientContext &context, DuckLakeCatalog &catalog, DuckLakeTransaction &transaction,
@@ -85,7 +93,7 @@ public:
 	DuckLakeCompactor(ClientContext &context, DuckLakeCatalog &catalog, DuckLakeTransaction &transaction,
 	                  Binder &binder, TableIndex table_id, uint64_t max_files, double delete_threshold);
 	//! Rewrite each partition whose files are not ordered by the table's sort into one sorted run
-	void SetSortMode(optional_idx max_slice_size);
+	void SetSortMode(optional_idx max_slice_size, bool single_writer);
 	void GenerateCompactions(DuckLakeTableEntry &table, vector<unique_ptr<LogicalOperator>> &compactions);
 	unique_ptr<LogicalOperator> GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry> source_files,
 	                                                      bool bind_to_latest_schema = false);
@@ -109,12 +117,12 @@ public:
 private:
 	bool PartitionIsSorted(DuckLakeTableEntry &latest_table, const vector<DuckLakeCompactionFileEntry> &files,
 	                       const vector<idx_t> &file_indexes);
-	vector<Value> ComputeSliceBoundaries(DuckLakeTableEntry &latest_table,
-	                                     const vector<DuckLakeCompactionFileEntry> &source_files);
+	vector<DuckLakeSliceBound> ComputeSliceBoundaries(DuckLakeTableEntry &latest_table,
+	                                                  const vector<DuckLakeCompactionFileEntry> &source_files);
 	unique_ptr<LogicalOperator> PlanSortedSlices(DuckLakeTableEntry &table, DuckLakeTableEntry &latest_table,
 	                                             DuckLakeSort &sort_data, unique_ptr<LogicalOperator> &first_scan,
 	                                             unique_ptr<LogicalCopyToFile> &first_copy,
-	                                             const vector<Value> &boundaries, const string &data_path,
+	                                             vector<DuckLakeSliceBound> boundaries, const string &data_path,
 	                                             const string &encryption_key, bool write_snapshot_id,
 	                                             const vector<DuckLakeFileListEntry> &files_to_scan);
 	optional_ptr<DuckLakeTableEntry> ResolvePartitionSpecTable(DuckLakeTableEntry &table,
@@ -131,6 +139,8 @@ private:
 	DuckLakeMergeAdjacentOptions options;
 	bool sort_mode = false;
 	optional_idx max_slice_size;
+	//! Whether all slices of a partition go to one writer that starts a new file at the target size
+	bool single_writer = false;
 
 	CompactionType type;
 };

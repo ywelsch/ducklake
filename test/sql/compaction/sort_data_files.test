@@ -105,6 +105,19 @@ SELECT count(*), sum(v), count(DISTINCT k) FROM t AT (VERSION => getvariable('be
 ----
 80000	799960000.0	200
 
+# the rows of every file are in key order
+statement ok
+SET VARIABLE t_files = (SELECT list(data_file) FROM ducklake_list_files('ducklake', 't'))
+
+query I
+SELECT count(*) FROM (
+	SELECT k, ts, lag(k) OVER w AS pk, lag(ts) OVER w AS pts
+	FROM read_parquet(getvariable('t_files'), filename = true, file_row_number = true)
+	WINDOW w AS (PARTITION BY filename ORDER BY file_row_number)
+) WHERE k < pk OR (k = pk AND ts < pts)
+----
+0
+
 # a sorted partition is left alone
 query I
 SELECT count(*) FROM ducklake_sort_data_files('ducklake', 't')
@@ -206,6 +219,143 @@ query II
 SELECT count(*), sum(v) FROM p
 ----
 8000	15996000
+
+# ranges of the second sort key over the live files that hold one value of the first, and how many overlap
+statement ok
+CREATE MACRO memory.second_key_ranges(tbl, first_col, first_value, col) AS TABLE
+WITH f AS (
+	SELECT s2.min_value AS lo, s2.max_value AS hi
+	FROM __ducklake_metadata_ducklake.ducklake_data_file d
+	JOIN __ducklake_metadata_ducklake.ducklake_table t ON t.table_id = d.table_id AND t.end_snapshot IS NULL
+	JOIN __ducklake_metadata_ducklake.ducklake_column c1
+		ON c1.table_id = d.table_id AND c1.end_snapshot IS NULL AND c1.column_name = first_col
+	JOIN __ducklake_metadata_ducklake.ducklake_file_column_stats s1
+		ON s1.data_file_id = d.data_file_id AND s1.column_id = c1.column_id
+	JOIN __ducklake_metadata_ducklake.ducklake_column c2
+		ON c2.table_id = d.table_id AND c2.end_snapshot IS NULL AND c2.column_name = col
+	JOIN __ducklake_metadata_ducklake.ducklake_file_column_stats s2
+		ON s2.data_file_id = d.data_file_id AND s2.column_id = c2.column_id
+	WHERE d.end_snapshot IS NULL AND t.table_name = tbl AND s1.min_value = first_value AND s1.max_value = first_value
+)
+SELECT count(*) AS file_count, count(*) FILTER (WHERE lo < prev_hi) AS overlap_count
+FROM (SELECT *, lag(hi) OVER (ORDER BY lo, hi) AS prev_hi FROM f)
+
+# one first key value holds most rows, so the sort splits it by the second key; NULL second keys sort last
+statement ok
+CREATE TABLE s (k VARCHAR, p VARCHAR, v BIGINT)
+
+statement ok
+ALTER TABLE s SET SORTED BY (k, p)
+
+# NULL second keys sort first
+statement ok
+CREATE TABLE sn (k VARCHAR, p VARCHAR, v BIGINT)
+
+statement ok
+ALTER TABLE sn SET SORTED BY (k, p NULLS FIRST)
+
+foreach tbl s sn
+
+statement ok
+CALL ducklake.set_option('parquet_row_group_size', '1024', table_name => '{tbl}')
+
+loop j 0 3
+
+statement ok
+INSERT INTO {tbl} SELECT CASE WHEN i % 10 = 0 THEN 'a' || (i % 7) ELSE 'big' END,
+	CASE WHEN i % 97 = 0 THEN NULL ELSE 'p' || lpad((i * 31 % 500)::VARCHAR, 3, '0') END, i + {j} * 20000
+FROM range(20000) r(i)
+
+endloop
+
+statement ok
+SET ducklake_target_file_size = '100KB'
+
+query I
+SELECT files_processed FROM ducklake_sort_data_files('ducklake', '{tbl}')
+----
+3
+
+query II
+SELECT file_count > 1, overlap_count FROM memory.second_key_ranges('{tbl}', 'k', 'big', 'p')
+----
+true	0
+
+query II
+SELECT file_count > 1, overlap_count FROM memory.file_ranges('{tbl}', 'k')
+----
+true	0
+
+query IIII
+SELECT count(*), count(p), sum(v), count(*) FILTER (WHERE k = 'big' AND p IS NULL) FROM {tbl}
+----
+60000	59379	1799970000	558
+
+statement ok
+SET VARIABLE s_files = (SELECT list(data_file) FROM ducklake_list_files('ducklake', '{tbl}'))
+
+query I
+SELECT count(*) FROM (
+	SELECT k, p, lag(k) OVER w AS pk, lag(p) OVER w AS pp
+	FROM read_parquet(getvariable('s_files'), filename = true, file_row_number = true)
+	WINDOW w AS (PARTITION BY filename ORDER BY file_row_number)
+) WHERE k < pk OR (k = pk AND ('{tbl}' = 's' AND (p < pp OR (p IS NOT NULL AND pp IS NULL)) OR '{tbl}' = 'sn' AND (p < pp OR (p IS NULL AND pp IS NOT NULL))))
+----
+0
+
+endloop
+
+# one writer for all slices starts a new file at the target size, however small the slices are, and without it every
+# slice writes its own file
+foreach sw true false
+
+statement ok
+CREATE TABLE w_{sw} (k VARCHAR, ts BIGINT, v DOUBLE)
+
+statement ok
+ALTER TABLE w_{sw} SET SORTED BY (k, ts)
+
+statement ok
+CALL ducklake.set_option('parquet_row_group_size', '1024', table_name => 'w_{sw}')
+
+loop j 0 4
+
+statement ok
+INSERT INTO w_{sw} SELECT 'k' || lpad((i * 7919 % 200)::VARCHAR, 3, '0'), i + {j} * 20000, i FROM range(20000) r(i)
+
+endloop
+
+statement ok
+SET ducklake_target_file_size = '100KB'
+
+query II
+SELECT files_processed > 1, files_created > 1 FROM ducklake_sort_data_files('ducklake', 'w_{sw}', max_slice_size => 20000, single_writer => {sw})
+----
+true	true
+
+query II
+SELECT file_count > 1, overlap_count FROM memory.file_ranges('w_{sw}', 'k')
+----
+true	0
+
+statement ok
+SET VARIABLE w_files = (SELECT list(data_file) FROM ducklake_list_files('ducklake', 'w_{sw}'))
+
+query I
+SELECT count(*) FROM (
+	SELECT k, ts, lag(k) OVER win AS pk, lag(ts) OVER win AS pts
+	FROM read_parquet(getvariable('w_files'), filename = true, file_row_number = true)
+	WINDOW win AS (PARTITION BY filename ORDER BY file_row_number)
+) WHERE k < pk OR (k = pk AND ts < pts)
+----
+0
+
+query III
+SELECT count(*), sum(v), count(DISTINCT k) FROM w_{sw}
+----
+80000	799960000.0	200
+
+endloop
 
 statement error
 SELECT * FROM ducklake_sort_data_files('ducklake', 't', max_slice_size => 0)
