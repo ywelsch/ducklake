@@ -78,12 +78,9 @@ public:
 //===--------------------------------------------------------------------===//
 // Compaction Command Generator
 //===--------------------------------------------------------------------===//
-//! Where a slice of a sorted rewrite starts: at a value of the first sort key, or inside the rows of one value of the
-//! first sort key at a value of the second
+//! Where a slice of a sorted rewrite starts: at the first row whose leading sort keys reach these values
 struct DuckLakeSliceBound {
-	Value first;
-	Value second;
-	bool has_second = false;
+	vector<Value> values;
 };
 
 class DuckLakeCompactor {

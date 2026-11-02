@@ -305,6 +305,71 @@ SELECT count(*) FROM (
 
 endloop
 
+# a first key value whose second key is mostly NULL holds most rows, so the sort splits it by the third key, an
+# expression; with one file per slice, the files of that group hold disjoint ranges of the third key
+statement ok
+CREATE TABLE h (k VARCHAR, p VARCHAR, r BIGINT, ts BIGINT)
+
+statement ok
+ALTER TABLE h SET SORTED BY (k, p, hash(r), ts)
+
+statement ok
+CREATE TABLE hn (k VARCHAR, p VARCHAR, r BIGINT, ts BIGINT)
+
+statement ok
+ALTER TABLE hn SET SORTED BY (k, p NULLS FIRST, hash(r), ts)
+
+foreach tbl h hn
+
+statement ok
+CALL ducklake.set_option('parquet_row_group_size', '1024', table_name => '{tbl}')
+
+loop j 0 3
+
+statement ok
+INSERT INTO {tbl} SELECT CASE WHEN i % 10 = 0 THEN 'a' || (i % 7) ELSE 'big' END,
+	CASE WHEN i % 10 = 0 OR i % 5 = 0 THEN 'p' || (i % 3) END, i * 7919 % 1000, i + {j} * 20000
+FROM range(20000) r(i)
+
+endloop
+
+query II
+SELECT files_processed, files_created > 3 FROM ducklake_sort_data_files('ducklake', '{tbl}', max_slice_size => 20000, single_writer => false)
+----
+3	true
+
+statement ok
+SET VARIABLE h_files = (SELECT list(data_file) FROM ducklake_list_files('ducklake', '{tbl}'))
+
+query II
+WITH f AS (
+	SELECT filename, min(hash(r)) AS lo, max(hash(r)) AS hi
+	FROM read_parquet(getvariable('h_files'), filename = true)
+	WHERE k = 'big' AND p IS NULL
+	GROUP BY filename
+)
+SELECT count(*) > 1, count(*) FILTER (WHERE lo <= prev_hi) FROM (SELECT *, lag(hi) OVER (ORDER BY lo, hi) AS prev_hi FROM f)
+----
+true	0
+
+query IIII
+SELECT count(*), count(p), sum(ts), count(*) FILTER (WHERE k = 'big' AND p IS NULL) FROM {tbl}
+----
+60000	12000	1799970000	48000
+
+query I
+SELECT count(*) FROM (
+	SELECT k, p, hash(r) AS h, ts, lag(k) OVER w AS pk, lag(p) OVER w AS pp, lag(hash(r)) OVER w AS ph, lag(ts) OVER w AS pts
+	FROM read_parquet(getvariable('h_files'), filename = true, file_row_number = true)
+	WINDOW w AS (PARTITION BY filename ORDER BY file_row_number)
+) WHERE k < pk
+	OR (k = pk AND ('{tbl}' = 'h' AND (p < pp OR (p IS NOT NULL AND pp IS NULL)) OR '{tbl}' = 'hn' AND (p < pp OR (p IS NULL AND pp IS NOT NULL))))
+	OR (k = pk AND p IS NOT DISTINCT FROM pp AND (h < ph OR (h = ph AND ts < pts)))
+----
+0
+
+endloop
+
 # one writer for all slices starts a new file at the target size, however small the slices are, and without it every
 # slice writes its own file
 foreach sw true false

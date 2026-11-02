@@ -25,6 +25,7 @@
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/planner/expression_binder/order_binder.hpp"
 #include "duckdb/planner/expression_binder/select_bind_state.hpp"
@@ -755,13 +756,58 @@ bool DuckLakeCompactor::PartitionIsSorted(DuckLakeTableEntry &latest_table,
 
 static DuckLakeSliceBound FirstKeyBound(Value first) {
 	DuckLakeSliceBound bound;
-	bound.first = std::move(first);
+	bound.values.push_back(std::move(first));
 	return bound;
 }
 
-//! Bounds that split the rows of the source files into slices of about max_slice_size. When the second sort key is a
-//! column, they come from the row count of each pair of the first two keys, so a first key value that holds more than
-//! a slice is split by the second key. Otherwise they are values of the first key from the row group statistics.
+namespace {
+//! The rows of the source files that share the values of the leading sort keys
+struct DuckLakeKeyGroup {
+	vector<Value> values;
+	idx_t rows;
+};
+} // namespace
+
+//! The ORDER BY of the first depth columns of a select list, in the order of the leading sort keys
+static string KeyOrderSQL(const DuckLakeSort &sort_data, idx_t depth) {
+	vector<string> orders;
+	for (idx_t i = 0; i < depth; i++) {
+		auto order = to_string(i + 1) + " ASC";
+		if (sort_data.fields[i].null_order == OrderByNullType::NULLS_FIRST) {
+			order += " NULLS FIRST";
+		} else if (sort_data.fields[i].null_order == OrderByNullType::NULLS_LAST) {
+			order += " NULLS LAST";
+		}
+		orders.push_back(std::move(order));
+	}
+	return StringUtil::Join(orders, ", ");
+}
+
+static string GroupFilterSQL(const vector<string> &keys, const vector<Value> &values) {
+	vector<string> terms;
+	for (idx_t i = 0; i < values.size(); i++) {
+		terms.push_back(values[i].IsNull() ? "(" + keys[i] + ") IS NULL"
+		                                   : "(" + keys[i] + ") = " + values[i].ToSQLString());
+	}
+	return "(" + StringUtil::Join(terms, " AND ") + ")";
+}
+
+static bool HasPrefix(const vector<Value> &values, const vector<Value> &prefix) {
+	for (idx_t i = 0; i < prefix.size(); i++) {
+		if (!ValueOperations::NotDistinctFrom(values[i], prefix[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! Counting the rows of more groups of sort key values than this would need too much memory
+static constexpr idx_t MAX_COUNTED_KEY_GROUPS = 1000000;
+
+//! Bounds that split the rows of the source files into slices of about max_slice_size. While the sort keys ascend,
+//! they come from the row count of each value of the first key, and a group that holds more than a slice is split by
+//! the next key, as long as the groups are few enough to count. Otherwise they are values of the first key from the
+//! row group statistics.
 vector<DuckLakeSliceBound>
 DuckLakeCompactor::ComputeSliceBoundaries(DuckLakeTableEntry &latest_table,
                                           const vector<DuckLakeCompactionFileEntry> &source_files) {
@@ -793,44 +839,115 @@ DuckLakeCompactor::ComputeSliceBoundaries(DuckLakeTableEntry &latest_table,
 	idx_t slice_count = (total_size + slice_size - 1) / slice_size;
 	auto file_list = "[" + StringUtil::Join(paths, ", ") + "]";
 
-	// a first key value is split by the second key only when both keys ascend
-	auto second_column = SortKeyColumn(latest_table, *sort_data, 1);
-	if (second_column && !second_column->Type().IsNested() &&
-	    sort_data->fields[0].sort_direction != OrderType::DESCENDING &&
-	    sort_data->fields[1].sort_direction != OrderType::DESCENDING) {
-		auto first_name = KeywordHelper::WriteOptionallyQuoted(key_column->Name().GetIdentifierName());
-		auto second_name = KeywordHelper::WriteOptionallyQuoted(second_column->Name().GetIdentifierName());
-		auto counts = transaction.ExecuteRaw(StringUtil::Format(
-		    "SELECT %s, %s, count(*) FROM read_parquet(%s) WHERE %s IS NOT NULL GROUP BY ALL ORDER BY ALL", first_name,
-		    second_name, file_list, first_name));
-		if (!counts->HasError()) {
-			vector<DuckLakeSliceBound> pairs;
-			vector<idx_t> pair_rows;
-			idx_t total_rows = 0;
-			for (auto &row : *counts) {
-				DuckLakeSliceBound pair;
-				pair.first = row.GetBaseValue(0);
-				pair.second = row.GetBaseValue(1);
-				pair.has_second = !pair.second.IsNull();
-				pairs.push_back(std::move(pair));
-				pair_rows.push_back(NumericCast<idx_t>(row.GetValue<int64_t>(2)));
-				total_rows += pair_rows.back();
-			}
-			idx_t rows_per_slice = MaxValue<idx_t>(total_rows / slice_count, 1);
-			idx_t seen_rows = 0;
-			for (idx_t i = 0; i < pairs.size(); i++) {
-				if (i > 0 && seen_rows >= rows_per_slice * (boundaries.size() + 1)) {
-					if (pairs[i].first != pairs[i - 1].first) {
-						boundaries.push_back(FirstKeyBound(pairs[i].first));
-					} else if (pairs[i].has_second) {
-						// NULL second keys sort after the others, so they never start a slice
-						boundaries.push_back(pairs[i]);
-					}
-				}
-				seen_rows += pair_rows[i];
-			}
-			return boundaries;
+	vector<string> keys;
+	for (auto &field : sort_data->fields) {
+		if (field.dialect != "duckdb" || field.sort_direction == OrderType::DESCENDING) {
+			break;
 		}
+		keys.push_back(field.expression);
+	}
+	auto count_groups = [&](idx_t depth, const string &filter, vector<DuckLakeKeyGroup> &groups) {
+		string select;
+		for (idx_t i = 0; i < depth; i++) {
+			select += "(" + keys[i] + "), ";
+		}
+		auto counts = transaction.ExecuteRaw(
+		    StringUtil::Format("SELECT %scount(*) FROM read_parquet(%s) WHERE %s GROUP BY ALL ORDER BY %s", select,
+		                       file_list, filter, KeyOrderSQL(*sort_data, depth)));
+		if (counts->HasError()) {
+			return false;
+		}
+		for (idx_t i = 0; i < depth; i++) {
+			if (counts->GetTypes()[i].IsNested()) {
+				return false;
+			}
+		}
+		for (auto &row : *counts) {
+			DuckLakeKeyGroup group;
+			for (idx_t i = 0; i < depth; i++) {
+				group.values.push_back(row.GetBaseValue(i));
+			}
+			group.rows = NumericCast<idx_t>(row.GetValue<int64_t>(depth));
+			groups.push_back(std::move(group));
+		}
+		return true;
+	};
+	// counting needs memory for every group, so it only runs when the groups are few
+	auto few_groups = [&](idx_t depth, const string &filter) {
+		vector<string> group_keys;
+		for (idx_t i = 0; i < depth; i++) {
+			group_keys.push_back("(" + keys[i] + ")");
+		}
+		auto estimate = transaction.ExecuteRaw(
+		    StringUtil::Format("SELECT approx_count_distinct(hash(%s)) FROM read_parquet(%s) WHERE %s",
+		                       StringUtil::Join(group_keys, ", "), file_list, filter));
+		if (estimate->HasError()) {
+			return false;
+		}
+		for (auto &row : *estimate) {
+			return NumericCast<idx_t>(row.GetValue<int64_t>(0)) <= MAX_COUNTED_KEY_GROUPS;
+		}
+		return false;
+	};
+	vector<DuckLakeKeyGroup> groups;
+	auto first_not_null = keys.empty() ? string() : "(" + keys.front() + ") IS NOT NULL";
+	if (!keys.empty() && few_groups(1, first_not_null) && count_groups(1, first_not_null, groups)) {
+		idx_t total_rows = 0;
+		for (auto &group : groups) {
+			total_rows += group.rows;
+		}
+		idx_t rows_per_slice = MaxValue<idx_t>(total_rows / slice_count, 1);
+		for (idx_t depth = 1; depth < keys.size(); depth++) {
+			vector<string> heavy;
+			for (auto &group : groups) {
+				if (group.values.size() == depth && group.rows > rows_per_slice) {
+					heavy.push_back(GroupFilterSQL(keys, group.values));
+				}
+			}
+			if (heavy.empty()) {
+				break;
+			}
+			auto heavy_filter = StringUtil::Join(heavy, " OR ");
+			vector<DuckLakeKeyGroup> parts;
+			if (!few_groups(depth + 1, heavy_filter) || !count_groups(depth + 1, heavy_filter, parts)) {
+				break;
+			}
+			// both lists follow the sort order, so the parts of each heavy group come next in parts
+			vector<DuckLakeKeyGroup> refined;
+			idx_t part_idx = 0;
+			for (auto &group : groups) {
+				bool split = false;
+				while (group.values.size() == depth && part_idx < parts.size() &&
+				       HasPrefix(parts[part_idx].values, group.values)) {
+					refined.push_back(std::move(parts[part_idx++]));
+					split = true;
+				}
+				if (!split) {
+					refined.push_back(std::move(group));
+				}
+			}
+			groups = std::move(refined);
+		}
+		idx_t seen_rows = 0;
+		for (idx_t i = 0; i < groups.size(); i++) {
+			if (i > 0 && seen_rows >= rows_per_slice * (boundaries.size() + 1)) {
+				// the shortest prefix of the group's values that sorts after the previous group
+				auto &previous = groups[i - 1].values;
+				auto &values = groups[i].values;
+				idx_t common = 0;
+				while (common < values.size() && common < previous.size() &&
+				       ValueOperations::NotDistinctFrom(values[common], previous[common])) {
+					common++;
+				}
+				if (common < values.size()) {
+					DuckLakeSliceBound bound;
+					bound.values.insert(bound.values.end(), values.begin(), values.begin() + common + 1);
+					boundaries.push_back(std::move(bound));
+				}
+			}
+			seen_rows += groups[i].rows;
+		}
+		return boundaries;
 	}
 
 	auto field_id = latest_table.GetFieldId(key_column->Physical()).GetFieldIndex();
@@ -868,7 +985,7 @@ WHERE s.field_id = %d AND m.stats_min_value IS NOT NULL)",
 		if (seen_rows < rows_per_slice * (boundaries.size() + 1) || !(row_groups[0].first < next_min)) {
 			continue;
 		}
-		if (boundaries.empty() || boundaries.back().first < next_min) {
+		if (boundaries.empty() || boundaries.back().values[0] < next_min) {
 			boundaries.push_back(FirstKeyBound(next_min));
 		}
 	}
@@ -880,88 +997,137 @@ static unique_ptr<Expression> CompareToBound(ExpressionType comparison, const Ex
 	    comparison, key.Copy(), make_uniq<BoundConstantExpression>(bound.DefaultCastAs(key.GetReturnType())));
 }
 
-static unique_ptr<Expression> Conjoin(ExpressionType type, unique_ptr<Expression> left, unique_ptr<Expression> right) {
-	if (!left) {
+static unique_ptr<Expression> BooleanConstant(bool value) {
+	return make_uniq<BoundConstantExpression>(Value::BOOLEAN(value));
+}
+
+static bool IsBooleanConstant(const Expression &expr, bool value) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	auto &constant = expr.Cast<BoundConstantExpression>().GetValue();
+	return constant.type().id() == LogicalTypeId::BOOLEAN && !constant.IsNull() && BooleanValue::Get(constant) == value;
+}
+
+static unique_ptr<Expression> And(unique_ptr<Expression> left, unique_ptr<Expression> right) {
+	if (IsBooleanConstant(*left, false) || IsBooleanConstant(*right, true)) {
+		return left;
+	}
+	if (IsBooleanConstant(*right, false) || IsBooleanConstant(*left, true)) {
 		return right;
 	}
-	return make_uniq<BoundConjunctionExpression>(type, std::move(left), std::move(right));
+	return make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(left), std::move(right));
 }
 
-static unique_ptr<Expression> KeyIsNull(const Expression &key) {
-	auto is_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
-	is_null->GetChildrenMutable().push_back(key.Copy());
-	return std::move(is_null);
-}
-
-//! The rows of one slice: keys from lower up to upper, with the NULL first keys in the slice that is written at their
-//! end. A NULL second key sorts to one end of its first key value and goes to the slice that holds that end.
-static unique_ptr<Expression> SliceCondition(const Expression &key, const BoundOrderByNode *second_key,
-                                             const DuckLakeSliceBound *lower, const DuckLakeSliceBound *upper,
-                                             bool with_nulls) {
-	unique_ptr<Expression> condition;
-	auto add = [&](unique_ptr<Expression> expr) {
-		condition = Conjoin(ExpressionType::CONJUNCTION_AND, std::move(condition), std::move(expr));
-	};
-	bool second_nulls_first = second_key && second_key->null_order == OrderByNullType::NULLS_FIRST;
-	auto second_from = [&](const Value &bound) {
-		auto expr = CompareToBound(ExpressionType::COMPARE_GREATERTHANOREQUALTO, *second_key->expression, bound);
-		if (second_nulls_first) {
-			return expr;
-		}
-		return Conjoin(ExpressionType::CONJUNCTION_OR, std::move(expr), KeyIsNull(*second_key->expression));
-	};
-	auto second_before = [&](const Value &bound) {
-		auto expr = CompareToBound(ExpressionType::COMPARE_LESSTHAN, *second_key->expression, bound);
-		if (!second_nulls_first) {
-			return expr;
-		}
-		return Conjoin(ExpressionType::CONJUNCTION_OR, std::move(expr), KeyIsNull(*second_key->expression));
-	};
-	if (lower && upper && upper->has_second && lower->first == upper->first) {
-		// part of one first key value, so the scan can prune row groups on both keys
-		add(CompareToBound(ExpressionType::COMPARE_EQUAL, key, upper->first));
-		if (lower->has_second) {
-			add(second_from(lower->second));
-		}
-		add(second_before(upper->second));
-	} else {
-		// the first key bounds alone also let the scan prune row groups
-		if (lower) {
-			add(CompareToBound(ExpressionType::COMPARE_GREATERTHANOREQUALTO, key, lower->first));
-			if (lower->has_second) {
-				add(Conjoin(ExpressionType::CONJUNCTION_OR,
-				            CompareToBound(ExpressionType::COMPARE_GREATERTHAN, key, lower->first),
-				            second_from(lower->second)));
-			}
-		}
-		if (upper && upper->has_second) {
-			add(CompareToBound(ExpressionType::COMPARE_LESSTHANOREQUALTO, key, upper->first));
-			add(Conjoin(ExpressionType::CONJUNCTION_OR,
-			            CompareToBound(ExpressionType::COMPARE_LESSTHAN, key, upper->first),
-			            second_before(upper->second)));
-		} else if (upper) {
-			add(CompareToBound(ExpressionType::COMPARE_LESSTHAN, key, upper->first));
-		}
+static unique_ptr<Expression> Or(unique_ptr<Expression> left, unique_ptr<Expression> right) {
+	if (IsBooleanConstant(*left, true) || IsBooleanConstant(*right, false)) {
+		return left;
 	}
-	if (with_nulls) {
-		condition = Conjoin(ExpressionType::CONJUNCTION_OR, std::move(condition), KeyIsNull(key));
+	if (IsBooleanConstant(*right, true) || IsBooleanConstant(*left, false)) {
+		return right;
+	}
+	return make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(left), std::move(right));
+}
+
+static unique_ptr<Expression> KeyIsNull(const Expression &key, bool is_null = true) {
+	auto expr = make_uniq<BoundOperatorExpression>(
+	    is_null ? ExpressionType::OPERATOR_IS_NULL : ExpressionType::OPERATOR_IS_NOT_NULL, LogicalType::BOOLEAN);
+	expr->GetChildrenMutable().push_back(key.Copy());
+	return std::move(expr);
+}
+
+//! Rows whose key sorts after the value. NULL first keys are left to the slice that holds them.
+static unique_ptr<Expression> KeyAfter(const BoundOrderByNode &key, const Value &value, bool first) {
+	bool nulls_first = key.null_order == OrderByNullType::NULLS_FIRST;
+	if (value.IsNull()) {
+		return nulls_first ? KeyIsNull(*key.expression, false) : BooleanConstant(false);
+	}
+	auto after = CompareToBound(ExpressionType::COMPARE_GREATERTHAN, *key.expression, value);
+	return nulls_first || first ? std::move(after) : Or(std::move(after), KeyIsNull(*key.expression));
+}
+
+//! Rows whose key sorts before the value. NULL first keys are left to the slice that holds them.
+static unique_ptr<Expression> KeyBefore(const BoundOrderByNode &key, const Value &value, bool first) {
+	bool nulls_first = key.null_order == OrderByNullType::NULLS_FIRST;
+	if (value.IsNull()) {
+		return nulls_first ? BooleanConstant(false) : KeyIsNull(*key.expression, false);
+	}
+	auto before = CompareToBound(ExpressionType::COMPARE_LESSTHAN, *key.expression, value);
+	return !nulls_first || first ? std::move(before) : Or(std::move(before), KeyIsNull(*key.expression));
+}
+
+static unique_ptr<Expression> KeyEquals(const BoundOrderByNode &key, const Value &value) {
+	return value.IsNull() ? KeyIsNull(*key.expression)
+	                      : CompareToBound(ExpressionType::COMPARE_EQUAL, *key.expression, value);
+}
+
+//! Rows at or after the bound, comparing the keys from position start on
+static unique_ptr<Expression> RowsFrom(const vector<BoundOrderByNode> &keys, const DuckLakeSliceBound &bound,
+                                       idx_t start) {
+	auto condition = BooleanConstant(true);
+	for (idx_t i = bound.values.size(); i > start; i--) {
+		auto &key = keys[i - 1];
+		auto &value = bound.values[i - 1];
+		condition = Or(KeyAfter(key, value, i == 1), And(KeyEquals(key, value), std::move(condition)));
 	}
 	return condition;
 }
 
-//! The first two sort keys bound against a scan, if the scan has the sort columns as the latest table has them
-static vector<BoundOrderByNode> BindLeadingSortKeys(Binder &binder, LogicalOperator &scan, DuckLakeTableEntry &table,
-                                                    const DuckLakeTableEntry &latest_table,
-                                                    const DuckLakeSort &sort_data) {
+//! Rows before the bound, comparing the keys from position start on
+static unique_ptr<Expression> RowsBefore(const vector<BoundOrderByNode> &keys, const DuckLakeSliceBound &bound,
+                                         idx_t start) {
+	auto condition = BooleanConstant(false);
+	for (idx_t i = bound.values.size(); i > start; i--) {
+		auto &key = keys[i - 1];
+		auto &value = bound.values[i - 1];
+		condition = Or(KeyBefore(key, value, i == 1), And(KeyEquals(key, value), std::move(condition)));
+	}
+	return condition;
+}
+
+//! The rows of one slice: from lower up to upper in the order of the leading sort keys, with the NULL first keys in the
+//! slice that is written at their end
+static unique_ptr<Expression> SliceCondition(const vector<BoundOrderByNode> &keys, const DuckLakeSliceBound *lower,
+                                             const DuckLakeSliceBound *upper, bool with_nulls) {
+	auto &first = *keys[0].expression;
+	auto condition = BooleanConstant(true);
+	// the values both bounds share, or else the range of the first key, let the scan prune row groups
+	idx_t common = 0;
+	while (lower && upper && common < lower->values.size() && common < upper->values.size() &&
+	       ValueOperations::NotDistinctFrom(lower->values[common], upper->values[common])) {
+		condition = And(std::move(condition), KeyEquals(keys[common], lower->values[common]));
+		common++;
+	}
+	if (common == 0 && lower) {
+		condition = And(std::move(condition),
+		                CompareToBound(ExpressionType::COMPARE_GREATERTHANOREQUALTO, first, lower->values[0]));
+	}
+	if (common == 0 && upper) {
+		auto comparison =
+		    upper->values.size() > 1 ? ExpressionType::COMPARE_LESSTHANOREQUALTO : ExpressionType::COMPARE_LESSTHAN;
+		condition = And(std::move(condition), CompareToBound(comparison, first, upper->values[0]));
+	}
+	if (lower && (common > 0 || lower->values.size() > 1)) {
+		condition = And(std::move(condition), RowsFrom(keys, *lower, common));
+	}
+	if (upper && (common > 0 || upper->values.size() > 1)) {
+		condition = And(std::move(condition), RowsBefore(keys, *upper, common));
+	}
+	if (with_nulls) {
+		condition = Or(std::move(condition), KeyIsNull(first));
+	}
+	return condition;
+}
+
+//! The sort keys bound against a scan, if the scan has the sort columns as the latest table has them
+static vector<BoundOrderByNode> BindSortKeys(Binder &binder, LogicalOperator &scan, DuckLakeTableEntry &table,
+                                             const DuckLakeTableEntry &latest_table, const DuckLakeSort &sort_data) {
 	auto scan_index = scan.GetColumnBindings()[0].table_index;
 	auto orders =
 	    DuckLakeCompactor::BindSortOrders(binder, latest_table.schema, latest_table.GetColumns(), latest_table.name,
 	                                      scan_index, DuckLakeCompactor::ParseSortOrders(sort_data));
 	if (orders.empty() || !ScanHasSortColumns(latest_table, table, orders, scan_index)) {
 		return {};
-	}
-	if (orders.size() > 2) {
-		orders.erase(orders.begin() + 2, orders.end());
 	}
 	return orders;
 }
@@ -974,26 +1140,27 @@ DuckLakeCompactor::PlanSortedSlices(DuckLakeTableEntry &table, DuckLakeTableEntr
                                     unique_ptr<LogicalCopyToFile> &first_copy, vector<DuckLakeSliceBound> boundaries,
                                     const string &data_path, const string &encryption_key, bool write_snapshot_id,
                                     const vector<DuckLakeFileListEntry> &files_to_scan) {
-	auto first_keys = BindLeadingSortKeys(binder, *first_scan, table, latest_table, sort_data);
+	auto first_keys = BindSortKeys(binder, *first_scan, table, latest_table, sort_data);
 	if (first_keys.empty()) {
 		return nullptr;
 	}
 	bool descending = first_keys[0].type == OrderType::DESCENDING;
 	bool nulls_first = first_keys[0].null_order == OrderByNullType::NULLS_FIRST;
-	// bounds inside a first key value need both keys ascending and the second key a column
-	bool split_by_second = first_keys.size() > 1 && !descending && first_keys[1].type != OrderType::DESCENDING &&
-	                       first_keys[1].expression->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF;
-	if (!split_by_second) {
-		vector<DuckLakeSliceBound> first_key_bounds;
-		for (auto &bound : boundaries) {
-			if (!bound.has_second) {
-				first_key_bounds.push_back(bound);
-			}
+	// a bound inside a first key value needs the keys it names to ascend
+	idx_t split_depth = 1;
+	while (!descending && split_depth < first_keys.size() && first_keys[split_depth].type != OrderType::DESCENDING &&
+	       !first_keys[split_depth].expression->GetReturnType().IsNested()) {
+		split_depth++;
+	}
+	vector<DuckLakeSliceBound> usable_bounds;
+	for (auto &bound : boundaries) {
+		if (bound.values.size() <= split_depth) {
+			usable_bounds.push_back(std::move(bound));
 		}
-		boundaries = std::move(first_key_bounds);
-		if (boundaries.empty()) {
-			return nullptr;
-		}
+	}
+	boundaries = std::move(usable_bounds);
+	if (boundaries.empty()) {
+		return nullptr;
 	}
 	idx_t slice_count = boundaries.size() + 1;
 	vector<unique_ptr<LogicalOperator>> slices;
@@ -1017,7 +1184,7 @@ DuckLakeCompactor::PlanSortedSlices(DuckLakeTableEntry &table, DuckLakeTableEntr
 				    return make_uniq<DuckLakeMultiFileList>(read_info, files_to_scan);
 			    },
 			    copy);
-			keys = BindLeadingSortKeys(binder, *scan, table, latest_table, sort_data);
+			keys = BindSortKeys(binder, *scan, table, latest_table, sort_data);
 			if (keys.empty()) {
 				throw InternalException("DuckLakeCompactor: failed to bind the sort key of a slice");
 			}
@@ -1027,9 +1194,7 @@ DuckLakeCompactor::PlanSortedSlices(DuckLakeTableEntry &table, DuckLakeTableEntr
 		auto lower = range_idx == 0 ? nullptr : &boundaries[range_idx - 1];
 		auto upper = range_idx + 1 == slice_count ? nullptr : &boundaries[range_idx];
 		bool with_nulls = nulls_first ? slice_idx == 0 : slice_idx + 1 == slice_count;
-		auto second_key = split_by_second ? &keys[1] : nullptr;
-		auto filter =
-		    make_uniq<LogicalFilter>(SliceCondition(*keys[0].expression, second_key, lower, upper, with_nulls));
+		auto filter = make_uniq<LogicalFilter>(SliceCondition(keys, lower, upper, with_nulls));
 		filter->children.push_back(std::move(scan));
 		unique_ptr<LogicalOperator> filtered = std::move(filter);
 		if (single_writer) {

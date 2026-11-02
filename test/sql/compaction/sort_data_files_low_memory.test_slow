@@ -1,0 +1,69 @@
+# name: test/sql/compaction/sort_data_files_low_memory.test_slow
+# description: ducklake_sort_data_files sorts one key range at a time, within a memory limit that one sort over the partition exceeds
+# group: [compaction]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/sort_data_files_low_memory', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE ducklake.m (k VARCHAR, ts BIGINT, s VARCHAR)
+
+statement ok
+ALTER TABLE ducklake.m SET SORTED BY (k, ts)
+
+loop j 0 4
+
+statement ok
+INSERT INTO ducklake.m SELECT 'k' || lpad((i * 7919 % 1000)::VARCHAR, 4, '0'), i + {j} * 1000000,
+	md5(i::VARCHAR) || md5((i + {j})::VARCHAR) || md5((i + 1)::VARCHAR)
+FROM range(1000000) r(i)
+
+endloop
+
+statement ok
+SET threads=4
+
+# the four files do not fit in memory as one sort and cannot spill
+statement ok
+SET memory_limit='600MB'
+
+statement ok
+SET temp_directory=''
+
+statement error
+SELECT * FROM ducklake_sort_data_files('ducklake', 'm', max_slice_size => 10000000000)
+----
+Out of Memory
+
+query II
+SELECT files_processed, files_created FROM ducklake_sort_data_files('ducklake', 'm', max_slice_size => 16000000)
+----
+4	1
+
+statement ok
+RESET memory_limit
+
+query III
+SELECT count(*), count(DISTINCT k), sum(ts) FROM ducklake.m
+----
+4000000	1000	7999998000000
+
+statement ok
+SET VARIABLE m_files = (SELECT list(data_file) FROM ducklake_list_files('ducklake', 'm'))
+
+query I
+SELECT count(*) FROM (
+	SELECT k, ts, lag(k) OVER w AS pk, lag(ts) OVER w AS pts
+	FROM read_parquet(getvariable('m_files'), filename = true, file_row_number = true)
+	WINDOW w AS (PARTITION BY filename ORDER BY file_row_number)
+) WHERE k < pk OR (k = pk AND ts < pts)
+----
+0
