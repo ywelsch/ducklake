@@ -683,6 +683,8 @@ void DuckLakeInsert::PreserveSortedOrder(PhysicalCopyToFile &physical_copy) {
 	// the rows are sorted and the batch copy operator does not rotate files by size
 	auto execution_mode = physical_copy.function.execution_mode(true, false);
 	physical_copy.parallel = execution_mode == CopyFunctionExecutionMode::PARALLEL_COPY_TO_FILE;
+	// a partitioned write would otherwise take the sorted rows on several threads and interleave them in each file
+	physical_copy.ordered_partitions = !physical_copy.parallel;
 }
 
 PhysicalOperator &DuckLakeInsert::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
