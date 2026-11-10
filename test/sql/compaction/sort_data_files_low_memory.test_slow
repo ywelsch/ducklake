@@ -28,6 +28,10 @@ FROM range(1000000) r(i)
 
 endloop
 
+# this test is about sorting in slices, not about merging inputs that are sorted already
+statement ok
+CALL ducklake.set_option('sorted_merge_compaction', 'false')
+
 statement ok
 SET threads=4
 
