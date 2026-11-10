@@ -466,6 +466,7 @@ struct DuckLakeAddedColumn {
 static constexpr const DuckLakeAddedColumn V1_1_ADDED_COLUMNS[] = {
     {"ducklake_data_file", "row_group_count", "BIGINT"},
     {"ducklake_delete_file", "row_group_count", "BIGINT"},
+    {"ducklake_data_file", "sort_id", "BIGINT"},
     {"ducklake_file_column_stats", "min_is_exact", "BOOLEAN DEFAULT NULL"},
     {"ducklake_file_column_stats", "max_is_exact", "BOOLEAN DEFAULT NULL"},
     {"ducklake_table_column_stats", "min_is_exact", "BOOLEAN DEFAULT NULL"},
@@ -2427,6 +2428,70 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetFilesForTable(DuckLake
 	return files;
 }
 
+map<DataFileIndex, DuckLakeDataFileMergeInfo>
+DuckLakeMetadataManager::ReadDataFileMergeInfo(TableIndex table_id, DuckLakeSnapshot snapshot) {
+	map<DataFileIndex, DuckLakeDataFileMergeInfo> result;
+	auto has_sort_id = transaction.GetCatalog().SupportsV1_1Metadata();
+	auto query = StringUtil::Format(R"(
+SELECT data_file_id, record_count, %s
+FROM {METADATA_CATALOG}.ducklake_data_file
+WHERE table_id=%d AND {SNAPSHOT_ID} >= begin_snapshot AND ({SNAPSHOT_ID} < end_snapshot OR end_snapshot IS NULL)
+)",
+	                                has_sort_id ? "sort_id" : "NULL::BIGINT", table_id.index);
+	auto query_result = Query(snapshot, query);
+	query_result->ThrowIfError("Failed to get data file merge info from DuckLake: ");
+	for (auto &row : *query_result) {
+		DuckLakeDataFileMergeInfo info;
+		info.record_count = row.GetValue<idx_t>(1);
+		if (!row.IsNull(2)) {
+			info.sort_id = row.GetValue<idx_t>(2);
+		}
+		result.emplace(DataFileIndex(row.GetValue<idx_t>(0)), info);
+	}
+	return result;
+}
+
+map<DataFileIndex, map<idx_t, DuckLakeFileKeyStats>>
+DuckLakeMetadataManager::ReadDataFileKeyStats(TableIndex table_id, DuckLakeSnapshot snapshot,
+                                              const vector<FieldIndex> &fields) {
+	map<DataFileIndex, map<idx_t, DuckLakeFileKeyStats>> result;
+	if (fields.empty()) {
+		return result;
+	}
+	vector<string> field_ids;
+	for (auto &field : fields) {
+		field_ids.push_back(to_string(field.index));
+	}
+	auto query = StringUtil::Format(R"(
+SELECT s.data_file_id, s.column_id, s.min_value, s.max_value, s.null_count, s.min_is_exact, s.max_is_exact,
+       s.contains_nan
+FROM {METADATA_CATALOG}.ducklake_file_column_stats s
+JOIN {METADATA_CATALOG}.ducklake_data_file d USING (data_file_id)
+WHERE d.table_id=%d AND s.column_id IN (%s) AND {SNAPSHOT_ID} >= d.begin_snapshot
+      AND ({SNAPSHOT_ID} < d.end_snapshot OR d.end_snapshot IS NULL)
+)",
+	                                table_id.index, StringUtil::Join(field_ids, ", "));
+	auto query_result = Query(snapshot, query);
+	query_result->ThrowIfError("Failed to get data file key statistics from DuckLake: ");
+	for (auto &row : *query_result) {
+		DuckLakeFileKeyStats stats;
+		stats.has_min = !row.IsNull(2);
+		if (stats.has_min) {
+			stats.min = row.GetValue<string>(2);
+		}
+		stats.has_max = !row.IsNull(3);
+		if (stats.has_max) {
+			stats.max = row.GetValue<string>(3);
+		}
+		stats.null_count = row.IsNull(4) ? 0 : row.GetValue<idx_t>(4);
+		stats.min_is_exact = !row.IsNull(5) && row.GetValue<bool>(5);
+		stats.max_is_exact = !row.IsNull(6) && row.GetValue<bool>(6);
+		stats.contains_nan = !row.IsNull(7) && row.GetValue<bool>(7);
+		result[DataFileIndex(row.GetValue<idx_t>(0))].emplace(row.GetValue<idx_t>(1), std::move(stats));
+	}
+	return result;
+}
+
 vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetTableInsertions(DuckLakeTableEntry &table,
                                                                           DuckLakeSnapshot start_snapshot,
                                                                           DuckLakeSnapshot end_snapshot) {
@@ -2763,11 +2828,12 @@ vector<DuckLakeCompactionFileEntry> DuckLakeMetadataManager::GetFilesForCompacti
 	// Determine the effective max file size threshold for filtering
 	idx_t effective_max_file_size =
 	    options.max_file_size.IsValid() ? options.max_file_size.GetIndex() : options.target_file_size;
+	string sort_id_select = transaction.GetCatalog().SupportsV1_1Metadata() ? "data.sort_id" : "NULL::BIGINT";
 	string data_select_list =
 	    "data.data_file_id, data.record_count, data.row_id_start, data.begin_snapshot, "
 	    "data.end_snapshot, data.mapping_id, sr.schema_version , data.partial_max, "
 	    "data.partition_id, partition_sr.schema_version AS partition_schema_version, partition_info.keys, " +
-	    GetDataFileSelectList("data");
+	    sort_id_select + ", " + GetDataFileSelectList("data");
 	string delete_select_list = "del.data_file_id AS del_data_file_id,"
 	                            "del.delete_file_id AS del_delete_file_id, "
 	                            "del.delete_count, "
@@ -2905,6 +2971,7 @@ ORDER BY data.begin_snapshot ASC, data.row_id_start ASC, data.data_file_id ASC, 
 			}
 		}
 		col_idx++;
+		new_entry.file.sort_id = OptIdx(row, col_idx++);
 		new_entry.file.data = ReadDataFile(table, row, col_idx, IsEncrypted());
 		if (files.empty() || files.back().file.id != new_entry.file.id) {
 			// new file - push it into the file list
@@ -4325,7 +4392,7 @@ string DuckLakeMetadataManager::WriteNewDataFilesWithAppender(DuckLakeSnapshot &
 		// ducklake_data_file columns:
 		// data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path, path_is_relative,
 		// file_format, record_count, file_size_bytes, footer_size, row_id_start, partition_id,
-		// encryption_key, mapping_id, partial_max, row_group_count (>= 1.1)
+		// encryption_key, mapping_id, partial_max, row_group_count (>= 1.1), sort_id (>= 1.1)
 		data_file_appender.BeginRow();
 		data_file_appender.Append<int64_t>(data_file_index);                            // data_file_id
 		data_file_appender.Append<int64_t>(table_id);                                   // table_id
@@ -4350,6 +4417,7 @@ string DuckLakeMetadataManager::WriteNewDataFilesWithAppender(DuckLakeSnapshot &
 		AppendBigintOrNull(data_file_appender, file.max_partial_file_snapshot);
 		if (supports_v1_1_metadata) {
 			AppendBigintOrNull(data_file_appender, file.row_group_count);
+			AppendBigintOrNull(data_file_appender, file.sort_id);
 		}
 		data_file_appender.EndRow();
 
@@ -4475,6 +4543,7 @@ string DuckLakeMetadataManager::WriteNewDataFilesSqlBatch(const vector<DuckLakeF
 		    file.file_size_bytes, footer_size, row_id, partition_id, encryption_key, mapping, partial_max);
 		if (supports_v1_1_metadata) {
 			data_file_value += ", " + DuckLakeUtil::OptionalIdxOrNull(file.row_group_count);
+			data_file_value += ", " + DuckLakeUtil::OptionalIdxOrNull(file.sort_id);
 		}
 		data_file_values.push_back(data_file_value + ")");
 		for (auto &raw_stats : file.column_stats) {
@@ -5042,26 +5111,42 @@ string DuckLakeMetadataManager::WriteNewSortKeys(const vector<DuckLakeSortInfo> 
 		return {};
 	}
 
-	set<TableIndex> altered_tables;
 	vector<string> sort_values;
 	vector<string> sort_expressions;
-	for (auto &new_sort : GetChangedSpecs(existing_sorts, new_sorts)) {
-		altered_tables.insert(new_sort.second.table_id);
-		if (!new_sort.second.id.IsValid()) {
-			// dropping sort data - skip adding new values but continue to set end_snapshot on old sort
-			continue;
+	auto append_sort = [&](const DuckLakeSortInfo &sort, const string &end_snapshot) {
+		if (!sort.id.IsValid()) {
+			return;
 		}
-		auto sort_id = new_sort.second.id.GetIndex();
+		auto sort_id = sort.id.GetIndex();
 		sort_values.push_back(
-		    StringUtil::Format(R"((%d, %d, {SNAPSHOT_ID}, NULL))", sort_id, new_sort.second.table_id.index));
-		for (auto &field : new_sort.second.fields) {
+		    StringUtil::Format("(%d, %d, {SNAPSHOT_ID}, %s)", sort_id, sort.table_id.index, end_snapshot));
+		for (auto &field : sort.fields) {
 			string sort_direction = (field.sort_direction == OrderType::DESCENDING ? "DESC" : "ASC");
 			string null_order = (field.null_order == OrderByNullType::NULLS_FIRST ? "NULLS_FIRST" : "NULLS_LAST");
-			sort_expressions.push_back(StringUtil::Format("(%d, %d, %d, %s, %s, %s, %s)", sort_id,
-			                                              new_sort.second.table_id.index, field.sort_key_index,
-			                                              SQLString(field.expression), SQLString(field.dialect),
-			                                              SQLString(sort_direction), SQLString(null_order)));
+			sort_expressions.push_back(StringUtil::Format("(%d, %d, %d, %s, %s, %s, %s)", sort_id, sort.table_id.index,
+			                                              field.sort_key_index, SQLString(field.expression),
+			                                              SQLString(field.dialect), SQLString(sort_direction),
+			                                              SQLString(null_order)));
 		}
+	};
+
+	unordered_map<idx_t, idx_t> last_sort_index;
+	for (idx_t i = 0; i < new_sorts.size(); i++) {
+		last_sort_index[new_sorts[i].table_id.index] = i;
+	}
+	for (idx_t i = 0; i < new_sorts.size(); i++) {
+		auto &sort = new_sorts[i];
+		if (i != last_sort_index[sort.table_id.index] && !sort.fields.empty()) {
+			// Files written before another sort change in the same transaction can still reference this sort.
+			append_sort(sort, "{SNAPSHOT_ID}");
+		}
+	}
+
+	set<TableIndex> altered_tables;
+	for (auto &new_sort : GetChangedSpecs(existing_sorts, new_sorts)) {
+		altered_tables.insert(new_sort.second.table_id);
+		// an invalid id drops the sort data: only the old sort's end_snapshot is set
+		append_sort(new_sort.second, "NULL");
 	}
 	return FlushDrop("ducklake_sort_info", "table_id", altered_tables) +
 	       InsertValuesSql("ducklake_sort_info", sort_values) +

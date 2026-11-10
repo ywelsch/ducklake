@@ -75,6 +75,8 @@ struct DuckLakeInsertPipeline {
 	reference<PhysicalOperator> root;
 	optional_ptr<DuckLakeInlineData> inline_data;
 	bool sorted = false;
+	//! The sort the written files are sorted by
+	optional_idx sort_id;
 
 	PhysicalOperator &AttachInsert(PhysicalOperator &insert, PhysicalOperator &copy);
 };
@@ -108,6 +110,8 @@ public:
 	map<string, string> ctas_table_options;
 	//! The partition id we are writing into (if any)
 	optional_idx partition_id;
+	//! The sort the written files are sorted by (if any)
+	optional_idx sort_id;
 	//! The encryption key used for writing the Parquet files
 	string encryption_key;
 	//! Whether the rows to insert depend on the rows of the table, like the NOT MATCHED rows of a MERGE
@@ -141,7 +145,7 @@ public:
 	                                    DuckLakeTableEntry &table, string encryption_key);
 	static void RemoveEmptyFiles(ClientContext &context, DuckLakeInsertGlobalState &gstate);
 	static void AddWrittenFiles(DuckLakeInsertGlobalState &gstate, DataChunk &chunk, const string &encryption_key,
-	                            optional_idx partition_id, bool set_snapshot_id = false);
+	                            optional_idx partition_id, optional_idx sort_id, bool set_snapshot_id = false);
 
 	static const DuckLakeFieldId &GetTopLevelColumn(DuckLakeCopyInput &copy_input, FieldIndex field_id,
 	                                                optional_idx &index);

@@ -49,6 +49,8 @@ public:
 	vector<Value> partition_values;
 	optional_idx row_id_start;
 	CompactionType type;
+	//! The sort the written files are sorted by (if any)
+	optional_idx sort_id;
 	//! Whether the rows reach the rotating copy in the order they must be written in
 	bool ordered_input = false;
 
@@ -122,6 +124,10 @@ private:
 	                                             vector<DuckLakeSliceBound> boundaries, const string &data_path,
 	                                             const string &encryption_key, bool write_snapshot_id,
 	                                             const vector<DuckLakeFileListEntry> &files_to_scan);
+	//! Whether the files are all sorted on the table's sort, so compacting them can merge instead of sort
+	bool CanMergeSorted(DuckLakeTableEntry &table, const vector<DuckLakeCompactionFileEntry> &files,
+	                    optional_idx sort_id);
+
 	optional_ptr<DuckLakeTableEntry> ResolvePartitionSpecTable(DuckLakeTableEntry &table,
 	                                                           const DuckLakeCompactionFileEntry &source_file,
 	                                                           idx_t partition_id);

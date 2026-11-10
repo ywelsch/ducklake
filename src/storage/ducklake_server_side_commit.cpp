@@ -260,6 +260,7 @@ void DuckLakeServerSideCommit::ReadStagedDataFiles() {
 	map<TableIndex, vector<DuckLakeDataFile>> files_per_table;
 	auto files_result = ScanStagedTable(DuckLakeStagedTableType::DATA_FILE);
 	bool has_created_by_ducklake = DuckLakeMetadataManager::ResultHasColumn(*files_result, "created_by_ducklake");
+	bool has_sort_id = DuckLakeMetadataManager::ResultHasColumn(*files_result, "sort_id");
 	for (auto &row : *files_result) {
 		DataFileIndex local_file_id(AsIdx(row, 0));
 		DuckLakeDataFile f;
@@ -278,6 +279,9 @@ void DuckLakeServerSideCommit::ReadStagedDataFiles() {
 		f.row_group_count = OptIdx(row, 16);
 		// staged tables from older clients lack the column, and only an added file has a name map
 		f.created_by_ducklake = has_created_by_ducklake ? row.GetValue<bool>(17) : !f.mapping_id.IsValid();
+		if (has_sort_id) {
+			f.sort_id = OptIdx(row, 18);
+		}
 		TakeIfPresent(per_file_stats, local_file_id, f.column_stats);
 		TakeIfPresent(attached_deletes, local_file_id.index, f.delete_files);
 		TakeIfPresent(partition_values_by_file, local_file_id.index, f.partition_values);

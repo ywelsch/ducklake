@@ -16,6 +16,7 @@
 namespace duckdb {
 
 ScalarFunction DuckLakeMurmur3Function();
+ScalarFunction DuckLakeMultisequenceSelectFunction();
 ScalarFunction DuckLakeUnreadableMacroDefaultFunction();
 
 static void LoadInternal(ExtensionLoader &loader) {
@@ -99,6 +100,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	DuckLakeListFilesFunction list_files;
 	loader.RegisterFunction(list_files);
 
+	DuckLakeSortedMergeSequenceFunction sorted_merge_sequence;
+	loader.RegisterFunction(sorted_merge_sequence);
+
+	DuckLakeSortedMergeFunction sorted_merge;
+	loader.RegisterFunction(sorted_merge);
+
+	DuckLakeSortedMergeWorkerLimitsFunction sorted_merge_worker_limits;
+	loader.RegisterFunction(sorted_merge_worker_limits);
+
 	auto add_files = DuckLakeAddDataFilesFunction::GetFunctions();
 	loader.RegisterFunction(add_files);
 
@@ -131,6 +141,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	auto unreadable_macro_default_func = DuckLakeUnreadableMacroDefaultFunction();
 	loader.RegisterFunction(unreadable_macro_default_func);
+
+	// The multisequence selection of the sorted merge, for testing
+	loader.RegisterFunction(DuckLakeMultisequenceSelectFunction());
 }
 
 // LCOV_EXCL_START

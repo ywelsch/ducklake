@@ -176,6 +176,7 @@ struct DuckLakeFileInfo {
 	optional_idx row_group_count;
 	optional_idx row_id_start;
 	optional_idx partition_id;
+	optional_idx sort_id;
 	optional_idx begin_snapshot;
 	optional_idx max_partial_file_snapshot;
 	string encryption_key;
@@ -471,10 +472,29 @@ struct DuckLakeFileForCleanup {
 	timestamp_tz_t time;
 };
 
+struct DuckLakeDataFileMergeInfo {
+	idx_t record_count = 0;
+	optional_idx sort_id;
+};
+
+//! The min/max statistics of a column of a data file
+struct DuckLakeFileKeyStats {
+	string min;
+	string max;
+	bool has_min = false;
+	bool has_max = false;
+	bool min_is_exact = false;
+	bool max_is_exact = false;
+	bool contains_nan = false;
+	idx_t null_count = 0;
+};
+
 struct DuckLakeCompactionFileData : public DuckLakeCompactionBaseFileData {
 	optional_idx row_id_start;
 	MappingIndex mapping_id;
 	optional_idx partition_id;
+	//! The sort the file was written sorted by
+	optional_idx sort_id;
 	vector<Value> partition_values;
 };
 

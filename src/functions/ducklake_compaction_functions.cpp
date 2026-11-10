@@ -5,6 +5,7 @@
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_schema_entry.hpp"
+#include "storage/ducklake_sorted_merge.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_insert.hpp"
 #include "storage/ducklake_partition_data.hpp"
@@ -129,8 +130,11 @@ PhysicalOperator &DuckLakeLogicalCompaction::CreatePlan(ClientContext &context, 
 			}
 		}
 	}
-	return planner.Make<DuckLakeCompaction>(types, table, std::move(source_files), std::move(encryption_key),
-	                                        partition_id, std::move(partition_values), row_id_start, child, type);
+	auto &compaction =
+	    planner.Make<DuckLakeCompaction>(types, table, std::move(source_files), std::move(encryption_key), partition_id,
+	                                     std::move(partition_values), row_id_start, child, type);
+	compaction.Cast<DuckLakeCompaction>().sort_id = sort_id;
+	return compaction;
 }
 
 //===--------------------------------------------------------------------===//
@@ -178,7 +182,7 @@ unique_ptr<GlobalSinkState> DuckLakeCompaction::GetGlobalSinkState(ClientContext
 
 SinkResultType DuckLakeCompaction::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &global_state = input.global_state.Cast<DuckLakeInsertGlobalState>();
-	DuckLakeInsert::AddWrittenFiles(global_state, chunk, encryption_key, partition_id);
+	DuckLakeInsert::AddWrittenFiles(global_state, chunk, encryption_key, partition_id, sort_id);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -748,6 +752,28 @@ bool DuckLakeCompactor::PartitionIsSorted(DuckLakeTableEntry &latest_table,
 	std::sort(bounds.begin(), bounds.end());
 	for (idx_t i = 1; i < bounds.size(); i++) {
 		if (bounds[i].first < bounds[i - 1].second) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool DuckLakeCompactor::CanMergeSorted(DuckLakeTableEntry &table, const vector<DuckLakeCompactionFileEntry> &files,
+                                       optional_idx sort_id) {
+	if (type != CompactionType::MERGE_ADJACENT_TABLES || !sort_id.IsValid()) {
+		return false;
+	}
+	auto table_sort = table.GetSortData();
+	if (!table_sort || table_sort->WrittenSortId() != sort_id ||
+	    !DuckLakeSortedMergeSequencer::HasMergeableSort(table)) {
+		return false;
+	}
+	auto schema_id = table.ParentSchema().Cast<DuckLakeSchemaEntry>().GetSchemaId();
+	if (catalog.GetConfigOption<string>("sorted_merge_compaction", schema_id, table_id, "true") != "true") {
+		return false;
+	}
+	for (auto &file : files) {
+		if (file.file.sort_id != sort_id) {
 			return false;
 		}
 	}
@@ -1343,6 +1369,8 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 		throw InternalException("Invalid Compaction Type");
 	}
 
+	// the scan below takes the file list, the sorted merge needs its own copy
+	auto merge_files = files_to_scan;
 	DuckLakeCopyInput copy_input(context, table, data_path);
 	// merge_adjacent_files does not use partitioning information - instead we always merge within partitions
 	copy_input.partition_data = nullptr;
@@ -1360,9 +1388,11 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 
 	auto &latest_table = GetLatestTableEntry(catalog, transaction, table);
 	auto sort_data = latest_table.GetSortData();
+	optional_idx sort_id;
 	bool sort_applied = false;
 	unique_ptr<LogicalOperator> sliced_copies;
 	if (sort_data) {
+		sort_id = sort_data->WrittenSortId();
 		if (sort_mode) {
 			auto boundaries = ComputeSliceBoundaries(latest_table, actionable_source_files);
 			if (!boundaries.empty()) {
@@ -1373,12 +1403,27 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 		}
 		if (sliced_copies) {
 			sort_applied = true;
+		} else if (CanMergeSorted(table, actionable_source_files, sort_id)) {
+			// every file is sorted on the table's sort already: merge them instead of sorting them
+			auto &scan_slot = root->type == LogicalOperatorType::LOGICAL_PROJECTION ? root->children[0] : root;
+			auto table_index = scan_slot->Cast<LogicalGet>().table_index;
+			idx_t estimated_rows = 0;
+			for (auto &source : actionable_source_files) {
+				estimated_rows += source.file.row_count - source.inlined_file_deletions.size();
+			}
+			scan_slot = PlanDuckLakeSortedMerge(table, std::move(merge_files), table_index, DEFAULT_ROW_GROUP_SIZE,
+			                                    write_snapshot_id, estimated_rows);
+			root->ResolveOperatorTypes();
+			sort_applied = true;
 		} else {
 			auto unsorted_root = root.get();
 			root = DuckLakeCompactor::InsertSort(binder, root, table, latest_table, sort_data);
 			// InsertSort returns root if the sort isn't in DuckDB dialect.
 			sort_applied = root.get() != unsorted_root;
 		}
+	}
+	if (!sort_applied) {
+		sort_id = optional_idx();
 	}
 
 	// adjacent files are merged into one file that starts at the first file's row_id_start
@@ -1408,6 +1453,7 @@ DuckLakeCompactor::GenerateCompactionCommand(vector<DuckLakeCompactionFileEntry>
 	    binder.GenerateTableIndex(), table, std::move(actionable_source_files), std::move(copy_input.encryption_key),
 	    partition_id, std::move(partition_values), target_row_id_start, type);
 	compaction->ordered_input = sort_applied && !merge_in_order;
+	compaction->sort_id = sort_id;
 	if (sliced_copies) {
 		// referencing the columns of the union of the copies keeps the optimizer from pruning them
 		sliced_copies->ResolveOperatorTypes();

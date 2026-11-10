@@ -156,7 +156,8 @@ static bool IsLeafColumnStats(const vector<Value> &col_stats) {
 }
 
 void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, DataChunk &chunk,
-                                     const string &encryption_key, optional_idx partition_id, bool set_snapshot_id) {
+                                     const string &encryption_key, optional_idx partition_id, optional_idx sort_id,
+                                     bool set_snapshot_id) {
 	auto skipped_fields = global_state.table.GetSkippedStatsFields();
 	auto &field_data = global_state.table.GetFieldData();
 	auto snapshot_id_name = InternalColumnName(field_data, "_ducklake_internal_snapshot_id");
@@ -183,6 +184,7 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
 		if (partition_id.IsValid()) {
 			data_file.partition_id = partition_id.GetIndex();
 		}
+		data_file.sort_id = sort_id;
 
 		// extract the column stats
 		auto column_stats = chunk.GetValue(4, r);
@@ -290,7 +292,7 @@ void DuckLakeInsert::AddWrittenFiles(DuckLakeInsertGlobalState &global_state, Da
 
 SinkResultType DuckLakeInsert::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &global_state = input.global_state.Cast<DuckLakeInsertGlobalState>();
-	AddWrittenFiles(global_state, chunk, encryption_key, partition_id);
+	AddWrittenFiles(global_state, chunk, encryption_key, partition_id, sort_id);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -742,6 +744,7 @@ DuckLakeInsertPipeline DuckLakeInsert::PlanInsertPipeline(ClientContext &context
 		if (sorted_plan) {
 			result.root = *sorted_plan;
 			result.sorted = true;
+			result.sort_id = sort_data->WrittenSortId();
 		}
 	}
 	if (data_inlining_row_limit > 0) {
@@ -756,6 +759,7 @@ DuckLakeInsertPipeline DuckLakeInsert::PlanInsertPipeline(ClientContext &context
 			if (sorted_plan) {
 				result.root = *sorted_plan;
 				result.sorted = true;
+				result.sort_id = sort_data->WrittenSortId();
 			}
 		}
 	}
@@ -763,6 +767,7 @@ DuckLakeInsertPipeline DuckLakeInsert::PlanInsertPipeline(ClientContext &context
 }
 
 PhysicalOperator &DuckLakeInsertPipeline::AttachInsert(PhysicalOperator &insert, PhysicalOperator &copy) {
+	insert.Cast<DuckLakeInsert>().sort_id = sort_id;
 	if (inline_data) {
 		inline_data->insert = insert.Cast<DuckLakeInsert>();
 	}
